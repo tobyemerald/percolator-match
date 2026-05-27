@@ -258,18 +258,21 @@ impl MatcherCtx {
         if self.fee_to_insurance_bps > 10_000 {
             return Err(ProgramError::InvalidAccountData);
         }
-        // 3E.4: max_inventory_abs == 0 disables the inventory limit entirely; reject as
-        // invalid config — callers must set an explicit bound.
-        if self.max_inventory_abs == 0 {
-            return Err(ProgramError::InvalidAccountData);
-        }
         // M-HIGH-2: max_inventory_abs must fit in i128 so `as i128` cast at call sites
-        // is lossless.  Values above i128::MAX are never representable as inventory.
+        // is lossless. v3-compat: max_inventory_abs == 0 is now treated as "unlimited"
+        // by check_inventory_limit (early-return at L708); the prior 3E.4 outright
+        // rejection was relaxed because v16 wrappers (e.g., percolator-prog v16-sync)
+        // pass max_inventory_abs = 0 to delegate inventory bounding to the wrapper's
+        // BackingBucketV16 layer.
         if self.max_inventory_abs > i128::MAX as u128 {
             return Err(ProgramError::InvalidAccountData);
         }
         // M-NEW-3: max_fill_abs must also fit in i128 so the `fill_abs as i128` cast in
-        // compute_{passive,vamm}_execution is lossless.
+        // compute_{passive,vamm}_execution is lossless. Init-time clamping at
+        // process_init ensures any caller-supplied u128::MAX is reduced to i128::MAX
+        // before storage — wrappers sending "unbounded" intent (e.g., percolator-prog
+        // v16-sync sends u128::MAX) get the effectively-unlimited i128::MAX sentinel
+        // without breaking the downstream cast invariant.
         if self.max_fill_abs > i128::MAX as u128 {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -401,6 +404,13 @@ pub fn process_init(
         }
     }
 
+    // v3-compat: clamp caller-supplied "unbounded" values (u128::MAX) to i128::MAX
+    // so the downstream `as i128` casts in compute_*_execution stay lossless
+    // (M-NEW-3 + M-HIGH-2 invariants). Wrappers signalling "no matcher-side limit"
+    // by passing u128::MAX get the effectively-unlimited i128::MAX sentinel.
+    let max_fill_clamped = core::cmp::min(params.max_fill_abs, i128::MAX as u128);
+    let max_inv_clamped = core::cmp::min(params.max_inventory_abs, i128::MAX as u128);
+
     let ctx = MatcherCtx {
         magic: MATCHER_MAGIC,
         version: MATCHER_VERSION,
@@ -412,11 +422,11 @@ pub fn process_init(
         max_total_bps: params.max_total_bps,
         impact_k_bps: params.impact_k_bps,
         liquidity_notional_e6: params.liquidity_notional_e6,
-        max_fill_abs: params.max_fill_abs,
+        max_fill_abs: max_fill_clamped,
         inventory_base: 0,
         last_oracle_price_e6: 0,
         last_exec_price_e6: 0,
-        max_inventory_abs: params.max_inventory_abs,
+        max_inventory_abs: max_inv_clamped,
         insurance_accrued_e6: 0,
         fee_to_insurance_bps: params.fee_to_insurance_bps,
         skew_spread_mult_bps: params.skew_spread_mult_bps,
@@ -1126,14 +1136,18 @@ mod tests {
         assert_eq!(ctx.lp_account_id, ctx2.lp_account_id);
     }
 
-    // 3E.4: validate() must reject max_inventory_abs == 0.
+    // v3-compat: validate() accepts max_inventory_abs == 0 as "unlimited" (no
+    // matcher-side bound; wrapper's BackingBucket layer enforces inventory).
+    // Runtime check_inventory_limit early-returns at L708 when 0. Originally
+    // 3E.4 rejected at validate(); relaxed for v16 wrapper compat (see init
+    // payload relaxation commit).
     #[test]
-    fn test_validation_rejects_zero_max_inventory_abs() {
+    fn test_validation_accepts_zero_max_inventory_abs_v3_compat() {
         let mut ctx = default_vamm_ctx();
         ctx.max_inventory_abs = 0;
         assert!(
-            ctx.validate().is_err(),
-            "validate() must reject max_inventory_abs == 0"
+            ctx.validate().is_ok(),
+            "validate() must accept max_inventory_abs == 0 in v3 (treated as unlimited)"
         );
     }
 
