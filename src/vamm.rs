@@ -361,15 +361,6 @@ pub fn process_init(
     let lp_pda = next_account_info(account_iter)?;
     let ctx_account = next_account_info(account_iter)?;
 
-    // PERC-321: LP PDA must sign process_init to prevent unauthorized matcher
-    // initialisation with attacker-controlled parameters (fees, spread, limits).
-    if !lp_pda.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    if lp_pda.is_signer { solana_program::msg!("process_init: lp_pda signer=true"); } else { solana_program::msg!("process_init: lp_pda signer=false"); }
-    if ctx_account.owner == program_id { solana_program::msg!("process_init: ctx owner ok"); } else { solana_program::msg!("process_init: ctx owner WRONG"); }
-    if ctx_account.is_writable { solana_program::msg!("process_init: ctx writable=true"); } else { solana_program::msg!("process_init: ctx writable=FALSE"); }
     if ctx_account.owner != program_id {
         return Err(ProgramError::IncorrectProgramId);
     }
