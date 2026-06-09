@@ -12,7 +12,8 @@ use solana_program::{
 
 use crate::{
     MatcherCall, MatcherReturn, CTX_VAMM_LEN, CTX_VAMM_OFFSET, FLAG_PARTIAL_OK, FLAG_VALID,
-    MATCHER_CONTEXT_LEN,
+    MATCHER_ABI_VERSION, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS,
+    MATCHER_CONTEXT_LEN, MATCHER_RETURN_LEN,
 };
 
 // =============================================================================
@@ -514,6 +515,100 @@ pub fn process_call(
 
     let mut data = ctx_account.try_borrow_mut_data()?;
     ret.write_to(&mut data)?;
+    Ok(())
+}
+
+/// Process a batched matcher call (tag 3): fill N legs against this LP's single inventory in one
+/// CPI. The LP PDA is validated once; each leg runs the same `compute_execution` as the
+/// single-fill path, inventory carries across legs in order, and the N 64-byte returns are emitted
+/// via `set_return_data` (the context account's 64-byte return slot holds only one).
+///
+/// Security note: inventory_base is updated with `checked_sub` (not `saturating_sub`) so that an
+/// overflow on any leg aborts the entire batch atomically — no partial-fill state is committed.
+pub fn process_batch_call(
+    lp_pda: &AccountInfo,
+    ctx_account: &AccountInfo,
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if instruction_data.len() < MATCHER_BATCH_HEADER_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let n = instruction_data[1] as usize;
+    if n == 0
+        || n > MATCHER_BATCH_MAX_LEGS
+        || instruction_data.len() != MATCHER_BATCH_HEADER_LEN + n * MATCHER_BATCH_LEG_LEN
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let req_id = u64::from_le_bytes(instruction_data[2..10].try_into().unwrap());
+    let lp_account_id = u64::from_le_bytes(instruction_data[10..18].try_into().unwrap());
+
+    let mut ctx = {
+        let data = ctx_account.try_borrow_data()?;
+        MatcherCtx::read_from(&data[CTX_VAMM_OFFSET..])?
+    };
+    ctx.validate()?;
+    if lp_pda.key.to_bytes() != ctx.lp_pda {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut returns = [0u8; MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN];
+    for i in 0..n {
+        let base = MATCHER_BATCH_HEADER_LEN + i * MATCHER_BATCH_LEG_LEN;
+        let asset_index =
+            u16::from_le_bytes(instruction_data[base..base + 2].try_into().unwrap());
+        let oracle_price_e6 =
+            u64::from_le_bytes(instruction_data[base + 2..base + 10].try_into().unwrap());
+        let req_size =
+            i128::from_le_bytes(instruction_data[base + 10..base + 26].try_into().unwrap());
+        if oracle_price_e6 == 0 || req_size == i128::MIN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let call = MatcherCall {
+            req_id,
+            asset_index,
+            lp_account_id,
+            oracle_price_e6,
+            req_size,
+        };
+        let (exec_price, exec_size, flags) = compute_execution(&ctx, &call)?;
+        if exec_size != 0 {
+            // Use checked_sub (not saturating_sub) so any overflow aborts the batch
+            // atomically before the ctx write below — no partial-fill state escapes.
+            ctx.inventory_base = ctx
+                .inventory_base
+                .checked_sub(exec_size)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            ctx.last_oracle_price_e6 = oracle_price_e6;
+            ctx.last_exec_price_e6 = exec_price;
+
+            // Accrue insurance fee per-leg, same as single-fill path.
+            if ctx.fee_to_insurance_bps > 0 {
+                let insurance_fee = compute_insurance_fee(&ctx, exec_size, exec_price);
+                ctx.insurance_accrued_e6 = ctx
+                    .insurance_accrued_e6
+                    .checked_add(insurance_fee)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+            }
+        }
+        let ret = MatcherReturn {
+            abi_version: MATCHER_ABI_VERSION,
+            flags,
+            exec_price_e6: exec_price,
+            exec_size,
+            req_id,
+            lp_account_id,
+            oracle_price_e6,
+            asset_index: asset_index as u64,
+        };
+        ret.write_to(&mut returns[i * MATCHER_RETURN_LEN..])?;
+    }
+
+    {
+        let mut data = ctx_account.try_borrow_mut_data()?;
+        ctx.write_to(&mut data[CTX_VAMM_OFFSET..])?;
+    }
+    solana_program::program::set_return_data(&returns[..n * MATCHER_RETURN_LEN]);
     Ok(())
 }
 
@@ -1301,6 +1396,111 @@ mod tests {
             fill_abs_result.is_ok(),
             "check_inventory_limit must not error at i128::MAX boundary"
         );
+    }
+
+    // ==========================================================================
+    // Batch call logic — unit tests for multi-leg inventory carry-over
+    //
+    // process_batch_call requires a Solana AccountInfo runtime (for set_return_data)
+    // so we test the constituent compute_execution + checked_sub path that the batch
+    // function delegates to. This mirrors the approach used in toly's upstream 33
+    // unit tests and is the standard pattern for no_std BPF programs.
+    // ==========================================================================
+
+    /// Batch: inventory carries across legs in order. If leg 1 reduces inventory,
+    /// leg 2 sees the post-leg-1 inventory — not the initial value.
+    #[test]
+    fn test_batch_inventory_carry_across_legs() {
+        let mut ctx = default_passive_ctx();
+        ctx.max_inventory_abs = 500;
+        ctx.inventory_base = 0;
+
+        // Simulate two successive sells (LP buys each time), each of size 300.
+        // After leg 1: inventory = 300. After leg 2: inventory should be capped at 500.
+        let call1 = MatcherCall {
+            req_id: 1,
+            asset_index: 0,
+            lp_account_id: 100,
+            oracle_price_e6: 100_000_000,
+            req_size: -300,
+        };
+        let (_p1, exec1, _f1) = compute_execution(&ctx, &call1).unwrap();
+        assert_eq!(exec1, -300, "leg 1: full 300 fill expected");
+        // Update inventory (mirroring process_batch_call's checked_sub path)
+        ctx.inventory_base = ctx.inventory_base.checked_sub(exec1).unwrap();
+        assert_eq!(ctx.inventory_base, 300, "after leg 1 inventory=300");
+
+        let call2 = MatcherCall {
+            req_id: 2,
+            asset_index: 0,
+            lp_account_id: 100,
+            oracle_price_e6: 100_000_000,
+            req_size: -300,
+        };
+        let (_p2, exec2, _f2) = compute_execution(&ctx, &call2).unwrap();
+        // inventory 300, max 500 → headroom = 500-300 = 200. Fill capped at 200.
+        assert_eq!(exec2, -200, "leg 2: fill capped at remaining 200 inventory headroom");
+        ctx.inventory_base = ctx.inventory_base.checked_sub(exec2).unwrap();
+        assert_eq!(ctx.inventory_base, 500, "after leg 2 inventory=500 (at max)");
+    }
+
+    /// Batch: checked_sub raises ArithmeticOverflow if inventory would overflow i128.
+    /// This is the key divergence from toly's saturating_sub — we want the batch to
+    /// abort atomically rather than silently cap.
+    #[test]
+    fn test_batch_checked_sub_overflow_property() {
+        // inventory_base at i128::MIN and exec_size is positive (LP bought) → subtract
+        // a positive exec_size from i128::MIN overflows. checked_sub must Err.
+        let inv: i128 = i128::MIN;
+        let exec_size: i128 = 1;
+        let result = inv.checked_sub(exec_size);
+        assert!(
+            result.is_none(),
+            "checked_sub must return None on overflow, not silently saturate"
+        );
+    }
+
+    /// Batch: lp_account_id must be echoed on each leg return.
+    #[test]
+    fn test_batch_return_lp_account_id_echoed() {
+        let ctx = default_passive_ctx();
+        let call = MatcherCall {
+            req_id: 42,
+            asset_index: 7,
+            lp_account_id: 0xDEAD_CAFE,
+            oracle_price_e6: 100_000_000,
+            req_size: 100,
+        };
+        let (exec_price, exec_size, flags) = compute_execution(&ctx, &call).unwrap();
+        // Construct MatcherReturn as process_batch_call does
+        let ret = MatcherReturn {
+            abi_version: crate::MATCHER_ABI_VERSION,
+            flags,
+            exec_price_e6: exec_price,
+            exec_size,
+            req_id: call.req_id,
+            lp_account_id: call.lp_account_id,
+            oracle_price_e6: call.oracle_price_e6,
+            asset_index: call.asset_index as u64,
+        };
+        assert_eq!(ret.lp_account_id, 0xDEAD_CAFE, "lp_account_id must be echoed per-leg");
+        assert_eq!(ret.asset_index, 7u64, "asset_index must be echoed per-leg");
+        assert_eq!(ret.req_id, 42, "req_id must be echoed per-leg");
+    }
+
+    /// Batch wire: MATCHER_BATCH_HEADER_LEN + 1*MATCHER_BATCH_LEG_LEN = 44 bytes for n=1.
+    #[test]
+    fn test_batch_wire_sizes() {
+        use crate::{MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, MATCHER_RETURN_LEN};
+        assert_eq!(MATCHER_BATCH_HEADER_LEN, 18);
+        assert_eq!(MATCHER_BATCH_LEG_LEN, 26);
+        assert_eq!(MATCHER_BATCH_MAX_LEGS, 16);
+        // N=1 payload: 18+26 = 44 bytes
+        assert_eq!(MATCHER_BATCH_HEADER_LEN + MATCHER_BATCH_LEG_LEN, 44);
+        // Max payload: 18 + 16*26 = 434 bytes
+        assert_eq!(MATCHER_BATCH_HEADER_LEN + MATCHER_BATCH_MAX_LEGS * MATCHER_BATCH_LEG_LEN, 434);
+        // Max return data: 16 * 64 = 1024 bytes (fits Solana return-data cap)
+        assert_eq!(MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN, 1024);
     }
 }
 

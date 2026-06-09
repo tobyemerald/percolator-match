@@ -9,6 +9,7 @@
 use percolator_match::{
     MatcherCall, MatcherReturn,
     MATCHER_CALL_LEN, MATCHER_CONTEXT_LEN, MATCHER_RETURN_LEN,
+    MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS,
     CTX_RETURN_OFFSET, CTX_VAMM_OFFSET, CTX_VAMM_LEN,
 };
 use percolator_match::vamm::{InitParams, MatcherCtx, INIT_CTX_LEN, MATCHER_MAGIC, MATCHER_VERSION};
@@ -300,6 +301,42 @@ fn init_params_field_offsets() {
     assert_eq!(u16::from_le_bytes(buf[68..70].try_into().unwrap()), params.skew_spread_mult_bps);
     // lp_account_id at 70..78
     assert_eq!(u64::from_le_bytes(buf[70..78].try_into().unwrap()), params.lp_account_id);
+}
+
+// ---------------------------------------------------------------------------
+// Batch call layout constants (tag 3)
+// ---------------------------------------------------------------------------
+
+/// MATCHER_BATCH_HEADER_LEN = tag(1) + n(1) + req_id(8) + lp_account_id(8) = 18
+#[test]
+fn batch_header_len_is_18() {
+    assert_eq!(
+        MATCHER_BATCH_HEADER_LEN,
+        1 + 1 + 8 + 8,
+        "batch header must be 18 bytes (tag+n+req_id+lp_account_id)"
+    );
+}
+
+/// MATCHER_BATCH_LEG_LEN = asset_index(2) + oracle_price_e6(8) + req_size(16) = 26
+#[test]
+fn batch_leg_len_is_26() {
+    assert_eq!(
+        MATCHER_BATCH_LEG_LEN,
+        2 + 8 + 16,
+        "each batch leg must be 26 bytes (asset_index+oracle_price_e6+req_size)"
+    );
+}
+
+/// Maximum legs such that N * MATCHER_RETURN_LEN <= 1024 (Solana return-data cap).
+#[test]
+fn batch_max_legs_fits_return_data_cap() {
+    let max_return_data: usize = 1024;
+    assert!(
+        MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN <= max_return_data,
+        "BATCH_MAX_LEGS * RETURN_LEN must not exceed 1024 (Solana return-data cap)"
+    );
+    assert_eq!(MATCHER_BATCH_MAX_LEGS, 16, "max 16 legs");
+    assert_eq!(MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN, 1024);
 }
 
 // ---------------------------------------------------------------------------

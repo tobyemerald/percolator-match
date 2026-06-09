@@ -3,7 +3,10 @@
 //! These tests lock the tag byte values against accidental reorderings.
 //! Any change here breaks the CPI ABI with percolator-prog and the SDK.
 
-use percolator_match::{MATCHER_ABI_VERSION, MATCHER_CALL_TAG, MATCHER_INIT_VAMM_TAG};
+use percolator_match::{
+    MATCHER_ABI_VERSION, MATCHER_BATCH_CALL_TAG, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN,
+    MATCHER_BATCH_MAX_LEGS, MATCHER_CALL_TAG, MATCHER_INIT_VAMM_TAG,
+};
 
 // ---------------------------------------------------------------------------
 // Tag value locks
@@ -47,14 +50,26 @@ fn parse_init_vamm_tag_byte() {
 }
 
 #[test]
-fn unknown_tag_3_is_not_reachable() {
-    // Tags 1 and 3+ are intentionally unassigned. If process_instruction were
-    // callable here without a validator we'd assert Err; instead we verify no
-    // known constant collides.
+fn tag_batch_call_is_3() {
+    // Tag 3 is the batched multi-fill CPI instruction added in v17 convergence.
+    // ABI version stays 3; single-fill (tag 0) is unchanged.
+    assert_eq!(MATCHER_BATCH_CALL_TAG, 3u8, "MATCHER_BATCH_CALL_TAG must be 3 — breaking change");
+}
+
+#[test]
+fn batch_layout_constants_locked() {
+    // These values are part of the on-chain wire format; changing them breaks the wrapper CPI.
+    assert_eq!(MATCHER_BATCH_HEADER_LEN, 18, "batch header must be 18 bytes");
+    assert_eq!(MATCHER_BATCH_LEG_LEN, 26, "each batch leg must be 26 bytes");
+    assert_eq!(MATCHER_BATCH_MAX_LEGS, 16, "max 16 legs per batch (16*64=1024 return-data cap)");
+}
+
+#[test]
+fn tag_1_is_unassigned() {
+    // Tag 1 is intentionally unassigned; no constant must collide with it.
     assert_ne!(MATCHER_CALL_TAG, 1u8);
     assert_ne!(MATCHER_INIT_VAMM_TAG, 1u8);
-    assert_ne!(MATCHER_CALL_TAG, 3u8);
-    assert_ne!(MATCHER_INIT_VAMM_TAG, 3u8);
+    assert_ne!(MATCHER_BATCH_CALL_TAG, 1u8);
 }
 
 // ---------------------------------------------------------------------------
